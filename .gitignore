@@ -16,9 +16,12 @@ build/
 *~
 .claude/
 
-# Data files (optional - comment out if you want to include them)
-# data/
-# trained_models/
+# Large data files (too big for GitHub)
+data/*.pkl
+*.pkl
+
+# Model weights (optional - uncomment to exclude)
+# trained_models/*.pth
 
 # OS
 .DS_Store
