@@ -115,6 +115,291 @@ class TransformerEqualizer(nn.Module):
         return x
 
 
+class BiLSTMEqualizer(nn.Module):
+    """Bidirectional LSTM equalizer for temporal sequence processing."""
+
+    def __init__(self, input_length=128, num_classes=2, hidden_size=128, num_layers=2):
+        super().__init__()
+
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+
+        # Bidirectional LSTM
+        self.lstm = nn.LSTM(
+            input_size=1,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=0.2 if num_layers > 1 else 0,
+            bidirectional=True
+        )
+
+        # Attention mechanism
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1)
+        )
+
+        # Classifier
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_size * 2, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(64, num_classes)
+        )
+
+    def forward(self, x):
+        # x shape: (batch, seq_len)
+        x = x.unsqueeze(-1)  # (batch, seq_len, 1)
+
+        # LSTM encoding
+        lstm_out, _ = self.lstm(x)  # (batch, seq_len, hidden_size*2)
+
+        # Attention weights
+        attention_weights = self.attention(lstm_out)  # (batch, seq_len, 1)
+        attention_weights = torch.softmax(attention_weights, dim=1)
+
+        # Weighted sum
+        context = torch.sum(attention_weights * lstm_out, dim=1)  # (batch, hidden_size*2)
+
+        # Classification
+        output = self.classifier(context)
+
+        return output
+
+
+class CNNLSTMHybrid(nn.Module):
+    """CNN-LSTM Hybrid: CNN for feature extraction + LSTM for temporal modeling."""
+
+    def __init__(self, input_length=128, num_classes=2):
+        super().__init__()
+
+        # CNN feature extractor
+        self.conv1 = nn.Conv1d(1, 64, kernel_size=7, padding=3)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.conv2 = nn.Conv1d(64, 128, kernel_size=5, padding=2)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.conv3 = nn.Conv1d(128, 256, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm1d(256)
+
+        self.pool = nn.MaxPool1d(2)
+        self.dropout_conv = nn.Dropout(0.2)
+
+        # LSTM for temporal processing
+        # After 3 pooling layers: input_length // 8
+        self.lstm = nn.LSTM(
+            input_size=256,
+            hidden_size=128,
+            num_layers=2,
+            batch_first=True,
+            dropout=0.2,
+            bidirectional=True
+        )
+
+        # Classifier
+        self.classifier = nn.Sequential(
+            nn.Linear(128 * 2, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, x):
+        # x shape: (batch, seq_len)
+        if len(x.shape) == 2:
+            x = x.unsqueeze(1)  # (batch, 1, seq_len)
+
+        # CNN feature extraction
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.pool(x)
+        x = self.dropout_conv(x)
+
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = self.pool(x)
+        x = self.dropout_conv(x)
+
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = self.pool(x)
+
+        # Prepare for LSTM: (batch, channels, seq_len) -> (batch, seq_len, channels)
+        x = x.permute(0, 2, 1)
+
+        # LSTM temporal modeling
+        lstm_out, _ = self.lstm(x)
+
+        # Global average pooling over time
+        x = lstm_out.mean(dim=1)  # (batch, hidden_size*2)
+
+        # Classification
+        x = self.classifier(x)
+
+        return x
+
+
+class TemporalConvNet(nn.Module):
+    """Temporal Convolutional Network (TCN) with dilated convolutions."""
+
+    def __init__(self, input_length=128, num_classes=2, num_channels=[64, 128, 256], kernel_size=3):
+        super().__init__()
+
+        layers = []
+        num_levels = len(num_channels)
+
+        for i in range(num_levels):
+            dilation_size = 2 ** i
+            in_channels = 1 if i == 0 else num_channels[i-1]
+            out_channels = num_channels[i]
+
+            # Dilated causal convolution
+            layers.append(nn.Conv1d(
+                in_channels,
+                out_channels,
+                kernel_size,
+                padding=(kernel_size - 1) * dilation_size,
+                dilation=dilation_size
+            ))
+            layers.append(nn.BatchNorm1d(out_channels))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(0.2))
+
+            # Residual connection
+            if i > 0:
+                layers.append(ResidualBlock(num_channels[i-1], out_channels))
+
+        self.network = nn.Sequential(*layers)
+
+        # Global pooling and classifier
+        self.classifier = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(num_channels[-1], 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, x):
+        # x shape: (batch, seq_len)
+        if len(x.shape) == 2:
+            x = x.unsqueeze(1)  # (batch, 1, seq_len)
+
+        # TCN processing
+        x = self.network(x)
+
+        # Trim to original length (remove padding)
+        x = x[:, :, :x.size(2)]
+
+        # Classification
+        x = self.classifier(x)
+
+        return x
+
+
+class ResidualBlock(nn.Module):
+    """Residual connection for TCN."""
+
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else None
+
+    def forward(self, x):
+        if self.conv:
+            return self.conv(x)
+        return x
+
+
+class AttentionCNN(nn.Module):
+    """CNN with Channel and Spatial Attention (CBAM-inspired)."""
+
+    def __init__(self, input_length=128, num_classes=2):
+        super().__init__()
+
+        # Convolutional layers with attention
+        self.conv1 = nn.Conv1d(1, 64, kernel_size=7, padding=3)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.attention1 = ChannelAttention(64)
+
+        self.conv2 = nn.Conv1d(64, 128, kernel_size=5, padding=2)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.attention2 = ChannelAttention(128)
+
+        self.conv3 = nn.Conv1d(128, 256, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm1d(256)
+        self.attention3 = ChannelAttention(256)
+
+        self.pool = nn.MaxPool1d(2)
+        self.dropout = nn.Dropout(0.2)
+
+        # Calculate flatten size
+        self.flatten_size = 256 * (input_length // 8)
+
+        # Classifier
+        self.classifier = nn.Sequential(
+            nn.Linear(self.flatten_size, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, x):
+        if len(x.shape) == 2:
+            x = x.unsqueeze(1)
+
+        # Layer 1 with attention
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.attention1(x) * x
+        x = self.pool(x)
+        x = self.dropout(x)
+
+        # Layer 2 with attention
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = self.attention2(x) * x
+        x = self.pool(x)
+        x = self.dropout(x)
+
+        # Layer 3 with attention
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = self.attention3(x) * x
+        x = self.pool(x)
+
+        # Flatten and classify
+        x = x.view(x.size(0), -1)
+        x = self.classifier(x)
+
+        return x
+
+
+class ChannelAttention(nn.Module):
+    """Channel attention mechanism."""
+
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.max_pool = nn.AdaptiveMaxPool1d(1)
+
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(),
+            nn.Linear(channels // reduction, channels, bias=False)
+        )
+
+    def forward(self, x):
+        b, c, _ = x.size()
+
+        avg_out = self.fc(self.avg_pool(x).view(b, c))
+        max_out = self.fc(self.max_pool(x).view(b, c))
+
+        out = torch.sigmoid(avg_out + max_out).view(b, c, 1)
+        return out
+
+
 def train_model(model, train_loader, val_loader, epochs=10, lr=1e-3, device='cuda'):
     """Quick training function."""
     model = model.to(device)
